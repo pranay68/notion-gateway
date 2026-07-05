@@ -1,0 +1,16 @@
+{
+  "name": "chatgpt-web-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental local OpenAI-style provider bridge backed by a dedicated signed-in ChatGPT web Chrome profile.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "health": "node -e \"fetch('http://127.0.0.1:3041/health').then(async r=>{console.log(await r.text()); process.exit(r.ok?0:1)}).catch(e=>{console.error(e.message); process.exit(1)})\"",
+    "ready": "node -e \"fetch('http://127.0.0.1:3041/ready').then(async r=>{console.log(await r.text()); process.exit(r.ok?0:1)}).catch(e=>{console.error(e.message); process.exit(1)})\"",
+    "test": "node --test server.test.js"
+  },
+  "dependencies": {
+    "playwright": "^1.55.1"
+  }
+}
