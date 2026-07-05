@@ -43,4 +43,3 @@ try {
 
 Write-Host 'Provider setup complete.' -ForegroundColor Green
 Write-Host 'Next: .\scripts\start-provider.ps1'
-

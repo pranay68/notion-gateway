@@ -23,4 +23,3 @@ if ($Generation) {
     $response = Invoke-RestMethod -Method Post -Uri "$base/v1/chat/completions" -Headers $headers -ContentType 'application/json' -Body $body -TimeoutSec 1800
     $response.choices[0].message.content
 }
-

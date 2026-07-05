@@ -16,7 +16,6 @@ if (-not (Get-Command node.exe -ErrorAction SilentlyContinue)) {
 if (-not $env:CLEAN_BRIDGE_API_TOKEN) {
     throw 'CLEAN_BRIDGE_API_TOKEN is required.'
 }
-
 $env:NOTION_RUNTIME = 'chrome'
 $env:CHROME_PATH = $chrome
 $env:CHROME_USER_DATA_DIR = Join-Path $repo 'data\chrome-profile'
@@ -29,4 +28,3 @@ try {
 } finally {
     Pop-Location
 }
-

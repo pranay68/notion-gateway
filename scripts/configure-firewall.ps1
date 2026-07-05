@@ -10,7 +10,6 @@ $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Run this script from an elevated PowerShell window.'
 }
-
 $ruleName = "Notion Gateway from $MainLaptopIp"
 if ($PSCmdlet.ShouldProcess($ruleName, "Allow TCP $Port only from $MainLaptopIp")) {
     Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
@@ -24,4 +23,3 @@ if ($PSCmdlet.ShouldProcess($ruleName, "Allow TCP $Port only from $MainLaptopIp"
         -Profile Private | Out-Null
     Write-Host "Firewall allows TCP $Port from $MainLaptopIp only." -ForegroundColor Green
 }
-

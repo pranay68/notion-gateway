@@ -21,7 +21,6 @@ function Import-GatewayEnvironment {
         [Environment]::SetEnvironmentVariable($name, $setting, 'Process')
     }
 }
-
 function Get-GatewayChromePath {
     $candidates = @(
         $env:CHROME_PATH,
@@ -32,4 +31,3 @@ function Get-GatewayChromePath {
 
     return $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 }
-
