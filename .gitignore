@@ -1,0 +1,12 @@
+node_modules/
+*.log
+*.pid
+.env
+.env.*
+!.env.example
+artifacts/
+work/
+profiles/
+*.tmp
+*.bak
+

@@ -1,0 +1,12 @@
+{
+  "name": "notion-bridge-clean",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Clean local Notion AI chat-completions bridge.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "health": "node -e \"fetch('http://127.0.0.1:3040/health').then(async r=>{console.log(await r.text()); process.exit(r.ok?0:1)}).catch(e=>{console.error(e.message); process.exit(1)})\"",
+    "test": "node --test server.test.js"
+  }
+}
