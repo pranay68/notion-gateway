@@ -44,6 +44,15 @@ After startup:
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1:3041/ready
 ```
 
+## Runtime Behavior
+
+- Default mode is non-interruptive: `CHATGPT_BRING_TO_FRONT=false`.
+- The bridge attaches to normal Chrome with `--remote-debugging-port=9444`.
+- Prompt insertion uses a background-safe locator fill path first.
+- Keyboard insertion exists only as fallback when locator fill cannot verify request anchors.
+- Keep `CHATGPT_MAX_CONCURRENT=1`; burst requests queue safely instead of competing for the same ChatGPT UI.
+- Do not use the provider Chrome profile for normal browsing.
+
 ## Test Generation
 
 ```powershell

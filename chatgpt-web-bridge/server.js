@@ -23,6 +23,7 @@ const STABLE_POLL_MS = Number(process.env.CHATGPT_STABLE_POLL_MS || 750);
 const MECHANICAL_TIMEOUT_MS = Number(process.env.CHATGPT_MECHANICAL_TIMEOUT_MS || 120000);
 const VIEWPORT_WIDTH = Number(process.env.CHATGPT_VIEWPORT_WIDTH || 1366);
 const VIEWPORT_HEIGHT = Number(process.env.CHATGPT_VIEWPORT_HEIGHT || 900);
+const BRING_TO_FRONT = String(process.env.CHATGPT_BRING_TO_FRONT || "false").toLowerCase() === "true";
 
 let browser = null;
 let browserProcess = null;
@@ -230,7 +231,7 @@ async function getPage() {
   if (!/chatgpt\.com|chat\.openai\.com/.test(page.url())) {
     await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: MECHANICAL_TIMEOUT_MS });
   }
-  await page.bringToFront();
+  if (BRING_TO_FRONT) await page.bringToFront();
   return page;
 }
 
@@ -338,9 +339,13 @@ async function openFreshChat(page, artifact) {
 
 async function clearComposer(page, composer, artifact) {
   addEvent(artifact, "composer_clear_started");
-  await composer.click({ timeout: MECHANICAL_TIMEOUT_MS });
-  await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
-  await page.keyboard.press("Backspace");
+  try {
+    await composer.fill("", { timeout: MECHANICAL_TIMEOUT_MS });
+  } catch {
+    await composer.click({ timeout: MECHANICAL_TIMEOUT_MS });
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
+    await page.keyboard.press("Backspace");
+  }
   await page.waitForTimeout(200);
   const snap = await snapshot(page);
   if (snap.composerText && snap.composerText.trim()) {
@@ -356,6 +361,27 @@ async function clearComposer(page, composer, artifact) {
   addEvent(artifact, "composer_clear_finished", await snapshot(page));
 }
 
+async function verifyInsertedPrompt(page, prompt, artifact, verificationLabel) {
+  const snap = await snapshot(page);
+  artifact.observedComposerLength = snap.composerText.length;
+  artifact.observedComposerPreview = snap.composerText.slice(0, 1000);
+  writeArtifact(artifact);
+  const observed = normalizeForAnchor(snap.composerText);
+  const missingAnchors = promptAnchors(prompt, artifact.requestId).filter((anchor) => !observed.includes(normalizeForAnchor(anchor)));
+  if (missingAnchors.length) {
+    return {
+      ok: false,
+      observedLength: snap.composerText.length,
+      missingAnchors
+    };
+  }
+  addEvent(artifact, "prompt_insert_verified", {
+    observedComposerLength: snap.composerText.length,
+    verification: verificationLabel
+  });
+  return { ok: true, observedLength: snap.composerText.length, missingAnchors: [] };
+}
+
 async function insertPrompt(page, prompt, artifact) {
   artifact.phase = "inserting_prompt";
   artifact.inputLength = prompt.length;
@@ -363,6 +389,20 @@ async function insertPrompt(page, prompt, artifact) {
   addEvent(artifact, "prompt_insert_started", { inputLength: prompt.length });
 
   const composer = await withTimeout(findComposer(page), MECHANICAL_TIMEOUT_MS, "composer acquisition");
+  await clearComposer(page, composer, artifact);
+
+  try {
+    artifact.transport = "playwright_locator_fill";
+    artifact.insertedChars = prompt.length;
+    writeArtifact(artifact);
+    await composer.fill(prompt, { timeout: MECHANICAL_TIMEOUT_MS });
+    const fillResult = await verifyInsertedPrompt(page, prompt, artifact, "marker_and_user_anchor_locator_fill");
+    if (fillResult.ok) return;
+    addEvent(artifact, "prompt_insert_fill_unverified", fillResult);
+  } catch (error) {
+    addEvent(artifact, "prompt_insert_fill_failed", { error: error.message });
+  }
+
   await clearComposer(page, composer, artifact);
   await composer.click({ timeout: MECHANICAL_TIMEOUT_MS });
 
@@ -381,16 +421,10 @@ async function insertPrompt(page, prompt, artifact) {
     }
   }
 
-  const snap = await snapshot(page);
-  artifact.observedComposerLength = snap.composerText.length;
-  artifact.observedComposerPreview = snap.composerText.slice(0, 1000);
-  writeArtifact(artifact);
-  const observed = normalizeForAnchor(snap.composerText);
-  const missingAnchors = promptAnchors(prompt, artifact.requestId).filter((anchor) => !observed.includes(normalizeForAnchor(anchor)));
-  if (missingAnchors.length) {
-    throw new Error(`prompt_insert_verification_failed: observed ${snap.composerText.length} chars after inserting ${prompt.length}; missing anchors: ${missingAnchors.join(" | ")}`);
+  const keyboardResult = await verifyInsertedPrompt(page, prompt, artifact, "marker_and_user_anchor_keyboard_insert");
+  if (!keyboardResult.ok) {
+    throw new Error(`prompt_insert_verification_failed: observed ${keyboardResult.observedLength} chars after inserting ${prompt.length}; missing anchors: ${keyboardResult.missingAnchors.join(" | ")}`);
   }
-  addEvent(artifact, "prompt_insert_verified", { observedComposerLength: snap.composerText.length, verification: "marker_and_user_anchor" });
 }
 
 async function submitPrompt(page, artifact) {
@@ -597,7 +631,8 @@ function healthPayload() {
     modelLabel: MODEL_LABEL || null
     ,
     debugPort: HEADLESS ? null : DEBUG_PORT,
-    launchMode: HEADLESS ? "playwright_headless" : "normal_chrome_cdp_attach"
+    launchMode: HEADLESS ? "playwright_headless" : "normal_chrome_cdp_attach",
+    bringToFront: BRING_TO_FRONT
   };
 }
 
