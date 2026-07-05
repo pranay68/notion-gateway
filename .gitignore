@@ -7,5 +7,6 @@ node_modules/
 artifacts/
 work/
 profiles/
+data/
 *.tmp
 *.bak

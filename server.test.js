@@ -14,8 +14,14 @@ const {
   extractOwnedBodyAnswer,
   extractPromptPayload,
   classifyAnswerEvidence,
+  createFixedWindowRateLimiter,
   hasAnswerGenerationEvidence,
   isCdpTransportError,
+  bearerTokenFromHeader,
+  isAuthorizedRequest,
+  isLoopbackHost,
+  isNotionRoute,
+  isNotionUrl,
   looksLikeCompleteJsonArtifact,
   mergeOwnershipEvidence,
   normalizeForMatch,
@@ -28,6 +34,41 @@ const {
   visibleOutputEvidence,
   visibleEnabledButtonState
 } = require("./server");
+
+test("LAN authentication accepts only the configured bearer token", () => {
+  assert.equal(bearerTokenFromHeader("Bearer bridge-secret"), "bridge-secret");
+  assert.equal(isAuthorizedRequest("Bearer bridge-secret", "bridge-secret"), true);
+  assert.equal(isAuthorizedRequest("Bearer wrong", "bridge-secret"), false);
+  assert.equal(isAuthorizedRequest("", "bridge-secret"), false);
+  assert.equal(isAuthorizedRequest("", ""), true);
+});
+
+test("loopback detection does not mistake LAN bind addresses for local-only", () => {
+  assert.equal(isLoopbackHost("127.0.0.1"), true);
+  assert.equal(isLoopbackHost("localhost"), true);
+  assert.equal(isLoopbackHost("::1"), true);
+  assert.equal(isLoopbackHost("0.0.0.0"), false);
+  assert.equal(isLoopbackHost("192.168.1.20"), false);
+});
+
+test("Notion target recognition supports desktop and Chrome canonical hosts", () => {
+  assert.equal(isNotionUrl("https://www.notion.so/ai"), true);
+  assert.equal(isNotionUrl("https://app.notion.com/chat?t=abc"), true);
+  assert.equal(isNotionRoute("https://www.notion.so/ai", "ai"), true);
+  assert.equal(isNotionRoute("https://app.notion.com/chat?t=abc", "chat"), true);
+  assert.equal(isNotionUrl("https://example.com/chat"), false);
+});
+
+test("fixed-window limiter rejects only requests above the configured burst", () => {
+  const check = createFixedWindowRateLimiter(2, 1000);
+  assert.equal(check("client-a", 1000).allowed, true);
+  assert.equal(check("client-a", 1100).allowed, true);
+  const rejected = check("client-a", 1200);
+  assert.equal(rejected.allowed, false);
+  assert.equal(rejected.retryAfterSeconds, 1);
+  assert.equal(check("client-b", 1200).allowed, true);
+  assert.equal(check("client-a", 2100).allowed, true);
+});
 
 test("prompt correlation uses only the user role payload", () => {
   const prompt = [

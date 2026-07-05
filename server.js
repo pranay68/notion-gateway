@@ -1,6 +1,7 @@
 "use strict";
 
 const http = require("http");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -8,11 +9,22 @@ const childProcess = require("child_process");
 
 const HOST = process.env.CLEAN_BRIDGE_HOST || "127.0.0.1";
 const PORT = Number(process.env.CLEAN_BRIDGE_PORT || 3040);
+const CDP_HOST = process.env.NOTION_DEBUG_HOST || "127.0.0.1";
 const DEBUG_PORT = Number(process.env.NOTION_DEBUG_PORT || 9333);
-const NOTION_URL = process.env.NOTION_AI_URL || "https://www.notion.so/ai";
+const NOTION_URL = process.env.NOTION_AI_URL || "https://app.notion.com/ai";
+const NOTION_RUNTIME = String(process.env.NOTION_RUNTIME || "desktop").trim().toLowerCase();
 const NOTION_EXE =
   process.env.NOTION_PATH ||
   path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Programs", "Notion", "Notion.exe");
+const CHROME_EXE = process.env.CHROME_PATH || [
+  path.join(process.env.PROGRAMFILES || "C:\\Program Files", "Google", "Chrome", "Application", "chrome.exe"),
+  path.join(process.env["PROGRAMFILES(X86)"] || "C:\\Program Files (x86)", "Google", "Chrome", "Application", "chrome.exe"),
+  path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Google", "Chrome", "Application", "chrome.exe")
+].find((candidate) => fs.existsSync(candidate));
+const CHROME_USER_DATA_DIR = process.env.CHROME_USER_DATA_DIR ||
+  path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "NotionGatewayChrome");
+const API_TOKEN = String(process.env.CLEAN_BRIDGE_API_TOKEN || "");
+const CORS_ORIGIN = String(process.env.CLEAN_BRIDGE_CORS_ORIGIN || "*");
 const REQUEST_TIMEOUT_MS = Math.max(0, Number(process.env.CLEAN_BRIDGE_TIMEOUT_MS || 0));
 const POLL_MS = Number(process.env.CLEAN_BRIDGE_POLL_MS || 1000);
 const QUIET_MS = Number(process.env.CLEAN_BRIDGE_QUIET_MS || 10000);
@@ -21,6 +33,7 @@ const ARTIFACT_DIR = process.env.CLEAN_BRIDGE_ARTIFACT_DIR || path.join(__dirnam
 const MAX_BODY_BYTES = Math.max(0, Number(process.env.MAX_BODY_BYTES || 0));
 const MAX_CONCURRENT_REQUESTS = Math.max(1, Number(process.env.CLEAN_BRIDGE_MAX_CONCURRENT || 1));
 const MAX_QUEUE_DEPTH = Math.max(0, Number(process.env.CLEAN_BRIDGE_MAX_QUEUE || 50));
+const RATE_LIMIT_PER_MINUTE = Math.max(0, Number(process.env.CLEAN_BRIDGE_RATE_LIMIT_PER_MINUTE || 60));
 const JOB_TIMEOUT_MS = Math.max(0, Number(process.env.CLEAN_BRIDGE_JOB_TIMEOUT_MS || 0));
 const CLEANUP_INTERVAL_MS = Math.max(5000, Number(process.env.CLEAN_BRIDGE_CLEANUP_INTERVAL_MS || 30000));
 const MAX_RETAINED_TABS = Math.max(1, Number(process.env.CLEAN_BRIDGE_MAX_RETAINED_TABS || 7));
@@ -58,6 +71,27 @@ let lastTransportError = null;
 let lastTransportRecoveryAt = null;
 const quarantinedTargetIds = new Set();
 
+function createFixedWindowRateLimiter(limit, windowMs = 60000) {
+  const clients = new Map();
+  return function check(key, now = Date.now()) {
+    if (limit <= 0) {
+      return { allowed: true, remaining: null, retryAfterSeconds: 0 };
+    }
+    const identity = String(key || "unknown");
+    let entry = clients.get(identity);
+    if (!entry || now - entry.startedAt >= windowMs) {
+      entry = { startedAt: now, count: 0 };
+      clients.set(identity, entry);
+    }
+    entry.count += 1;
+    const remaining = Math.max(0, limit - entry.count);
+    const retryAfterSeconds = Math.max(1, Math.ceil((entry.startedAt + windowMs - now) / 1000));
+    return { allowed: entry.count <= limit, remaining, retryAfterSeconds };
+  };
+}
+
+const checkRateLimit = createFixedWindowRateLimiter(RATE_LIMIT_PER_MINUTE);
+
 function log(message, extra) {
   const stamp = new Date().toISOString();
   if (extra === undefined) {
@@ -69,6 +103,26 @@ function log(message, extra) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isNotionUrl(value) {
+  try {
+    const host = new URL(String(value || "")).hostname.toLowerCase();
+    return host === "notion.so" || host.endsWith(".notion.so") || host === "notion.com" || host.endsWith(".notion.com");
+  } catch (_error) {
+    return false;
+  }
+}
+
+function isNotionRoute(value, route) {
+  if (!isNotionUrl(value)) {
+    return false;
+  }
+  try {
+    return new URL(String(value)).pathname.toLowerCase().startsWith(`/${String(route || "").replace(/^\/+/, "").toLowerCase()}`);
+  } catch (_error) {
+    return false;
+  }
 }
 
 function visibleEnabledButtonState(entry) {
@@ -108,6 +162,39 @@ function nextRequestId() {
 function sendJson(res, status, payload) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(payload));
+}
+
+function isLoopbackHost(host) {
+  const value = String(host || "").trim().toLowerCase();
+  return value === "127.0.0.1" || value === "localhost" || value === "::1" || value === "[::1]";
+}
+
+function secureTokenEqual(received, expected) {
+  const left = Buffer.from(String(received || ""));
+  const right = Buffer.from(String(expected || ""));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function bearerTokenFromHeader(header) {
+  const match = String(header || "").match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
+}
+
+function isAuthorizedRequest(authorizationHeader, expectedToken = API_TOKEN) {
+  if (!expectedToken) {
+    return true;
+  }
+  return secureTokenEqual(bearerTokenFromHeader(authorizationHeader), expectedToken);
+}
+
+function validateNetworkConfig(host = HOST, token = API_TOKEN) {
+  if (!isLoopbackHost(host) && !token) {
+    throw new Error("CLEAN_BRIDGE_API_TOKEN is required when CLEAN_BRIDGE_HOST is not loopback.");
+  }
+  if (!isLoopbackHost(CDP_HOST)) {
+    throw new Error("NOTION_DEBUG_HOST must remain loopback; CDP must never be exposed on the LAN.");
+  }
+  return true;
 }
 
 function pumpQueue() {
@@ -438,7 +525,7 @@ function shouldAttemptSubmitAfterInsert(state, elapsedMs, timeoutMs) {
     && Number(elapsedMs || 0) >= Number(timeoutMs || 0)
     && Number(state?.inputLength || 0) > 0
     && !state?.submitReady
-    && !String(state?.url || "").includes("notion.so/chat");
+    && !isNotionRoute(state?.url, "chat");
 }
 
 function promptContainsCandidate(prompt, candidate) {
@@ -508,50 +595,89 @@ async function fetchJson(url, options = {}) {
   return text ? JSON.parse(text) : {};
 }
 
-function launchNotionIfNeeded() {
+function runtimeDefinition() {
+  if (NOTION_RUNTIME === "chrome") {
+    if (!CHROME_EXE || !fs.existsSync(CHROME_EXE)) {
+      throw new Error("Chrome executable not found. Set CHROME_PATH.");
+    }
+    return {
+      name: "chrome",
+      executable: CHROME_EXE,
+      processName: "chrome.exe",
+      identityPattern: CHROME_USER_DATA_DIR,
+      args: [
+        `--remote-debugging-port=${DEBUG_PORT}`,
+        `--remote-debugging-address=${CDP_HOST}`,
+        `--user-data-dir=${CHROME_USER_DATA_DIR}`,
+        "--no-first-run",
+        "--no-default-browser-check",
+        NOTION_URL
+      ]
+    };
+  }
+  if (NOTION_RUNTIME !== "desktop") {
+    throw new Error(`Unsupported NOTION_RUNTIME: ${NOTION_RUNTIME}`);
+  }
   if (!fs.existsSync(NOTION_EXE)) {
     throw new Error(`Notion.exe not found at ${NOTION_EXE}`);
   }
-
-  const existing = childProcess.execFileSync(
-    "powershell",
-    [
-      "-NoProfile",
-      "-Command",
-      `Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'Notion.exe' -and $_.CommandLine -match '--remote-debugging-port=${DEBUG_PORT}' } | Select-Object -ExpandProperty ProcessId`
-    ],
-    { encoding: "utf8" }
-  ).trim();
-
-  if (existing) {
-    return Number(existing.split(/\r?\n/)[0]);
-  }
-
-  try {
-    childProcess.execFileSync("taskkill", ["/IM", "Notion.exe", "/F", "/T"], { encoding: "utf8" });
-  } catch (_error) {
-  }
-
-  const started = childProcess.execFileSync(
-    "powershell",
-    [
-      "-NoProfile",
-      "-Command",
-      `$p = Start-Process -FilePath '${NOTION_EXE.replace(/'/g, "''")}' -ArgumentList @('--remote-debugging-port=${DEBUG_PORT}') -PassThru; $p.Id`
-    ],
-    { encoding: "utf8" }
-  ).trim();
-  return Number(started.split(/\r?\n/)[0]);
+  return {
+    name: "desktop",
+    executable: NOTION_EXE,
+    processName: "Notion.exe",
+    identityPattern: `--remote-debugging-port=${DEBUG_PORT}`,
+    args: [`--remote-debugging-port=${DEBUG_PORT}`]
+  };
 }
 
-function restartNotionForTransportRecovery(reason) {
-  log("Restarting Notion after CDP transport failure", reason);
-  try {
-    childProcess.execFileSync("taskkill", ["/IM", "Notion.exe", "/F", "/T"], { encoding: "utf8" });
-  } catch (_error) {
+function runtimeProcessIds(definition = runtimeDefinition()) {
+  const processName = definition.processName.replace(/'/g, "''");
+  const identityPattern = definition.identityPattern.replace(/'/g, "''");
+  const output = childProcess.execFileSync(
+    "powershell",
+    [
+      "-NoProfile",
+      "-Command",
+      `Get-CimInstance Win32_Process | Where-Object { $_.Name -eq '${processName}' -and $_.CommandLine -like '*${identityPattern}*' } | Select-Object -ExpandProperty ProcessId`
+    ],
+    { encoding: "utf8" }
+  ).trim();
+  return output ? output.split(/\r?\n/).map(Number).filter(Number.isFinite) : [];
+}
+
+function launchRuntimeIfNeeded() {
+  const definition = runtimeDefinition();
+  const existing = runtimeProcessIds(definition);
+  if (existing.length) {
+    return existing[0];
   }
+  if (definition.name === "chrome") {
+    fs.mkdirSync(CHROME_USER_DATA_DIR, { recursive: true });
+  }
+  const child = childProcess.spawn(definition.executable, definition.args, {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: false
+  });
+  child.unref();
+  return child.pid;
+}
+
+function stopRuntimeProcesses() {
+  const definition = runtimeDefinition();
+  for (const pid of runtimeProcessIds(definition)) {
+    try {
+      childProcess.execFileSync("taskkill", ["/PID", String(pid), "/F", "/T"], { encoding: "utf8" });
+    } catch (_error) {
+    }
+  }
+}
+
+function restartRuntimeForTransportRecovery(reason) {
+  log(`Restarting ${NOTION_RUNTIME} runtime after CDP transport failure`, reason);
+  stopRuntimeProcesses();
   quarantinedTargetIds.clear();
-  const pid = launchNotionIfNeeded();
+  const pid = launchRuntimeIfNeeded();
   transportDegraded = false;
   lastTransportRecoveryAt = new Date().toISOString();
   return pid;
@@ -561,7 +687,7 @@ async function waitForDebugTargets() {
   const started = Date.now();
   while (Date.now() - started < 30000) {
     try {
-      const targets = await fetchJson(`http://${HOST}:${DEBUG_PORT}/json/list`);
+      const targets = await fetchJson(`http://${CDP_HOST}:${DEBUG_PORT}/json/list`);
       if (Array.isArray(targets) && targets.length) {
         return targets;
       }
@@ -581,7 +707,7 @@ async function createFreshTarget() {
 
   await previous.catch(() => {});
   try {
-    launchNotionIfNeeded();
+    launchRuntimeIfNeeded();
     const beforeTargets = await waitForDebugTargets();
     const beforeIds = new Set(beforeTargets.map((target) => target.id).filter(Boolean));
     const seedTarget = pickPageTarget(beforeTargets);
@@ -632,7 +758,7 @@ async function closeTarget(targetId) {
     return;
   }
   try {
-    await fetch(`http://${HOST}:${DEBUG_PORT}/json/close/${encodeURIComponent(targetId)}`);
+    await fetch(`http://${CDP_HOST}:${DEBUG_PORT}/json/close/${encodeURIComponent(targetId)}`);
   } catch (_error) {
   }
 }
@@ -641,7 +767,7 @@ async function listDebugTargetsQuick() {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 2000);
-    const response = await fetch(`http://${HOST}:${DEBUG_PORT}/json/list`, { signal: controller.signal });
+    const response = await fetch(`http://${CDP_HOST}:${DEBUG_PORT}/json/list`, { signal: controller.signal });
     clearTimeout(timer);
     if (!response.ok) {
       return [];
@@ -713,7 +839,7 @@ async function dismissKnownOverlaysAcrossTargets() {
   const targets = (await listDebugTargetsQuick()).filter((target) =>
     target?.type === "page" &&
     target.webSocketDebuggerUrl &&
-    String(target.url || "").startsWith("https://www.notion.so/")
+    isNotionUrl(target.url)
   );
   let clicked = 0;
   let scanned = 0;
@@ -781,7 +907,7 @@ async function findMatchingChatTarget(prompt, artifact, options = {}) {
     target &&
     target.type === "page" &&
     target.webSocketDebuggerUrl &&
-    String(target.url || "").includes("notion.so/chat")
+    isNotionRoute(target.url, "chat")
   );
   for (const target of targets) {
     const client = createCdpClient(target.webSocketDebuggerUrl);
@@ -853,9 +979,9 @@ function pickPageTarget(targets) {
     ? targets.filter((target) => target && target.type === "page" && target.webSocketDebuggerUrl && !quarantinedTargetIds.has(target.id))
     : [];
   return (
-    [...pages].reverse().find((target) => String(target.url || "").includes("notion.so/ai")) ||
-    [...pages].reverse().find((target) => String(target.url || "").includes("notion.so/chat")) ||
-    [...pages].reverse().find((target) => String(target.url || "").includes("notion.so")) ||
+    [...pages].reverse().find((target) => isNotionRoute(target.url, "ai")) ||
+    [...pages].reverse().find((target) => isNotionRoute(target.url, "chat")) ||
+    [...pages].reverse().find((target) => isNotionUrl(target.url)) ||
     pages[0]
   );
 }
@@ -956,7 +1082,7 @@ async function probeCdpTarget(target) {
 async function connectNotionPage(artifact = null) {
   let lastConnectError = null;
   for (let attempt = 1; attempt <= CDP_CONNECT_ATTEMPTS; attempt += 1) {
-    launchNotionIfNeeded();
+    launchRuntimeIfNeeded();
     const targets = await waitForDebugTargets();
     const target = pickPageTarget(targets);
     if (!target) {
@@ -992,7 +1118,7 @@ async function connectNotionPage(artifact = null) {
     }
 
     if (attempt < CDP_CONNECT_ATTEMPTS && isCdpTransportError(lastConnectError)) {
-      restartNotionForTransportRecovery(lastTransportError || lastConnectError.message);
+      restartRuntimeForTransportRecovery(lastTransportError || lastConnectError.message);
       await delay(2500);
       continue;
     }
@@ -1002,7 +1128,7 @@ async function connectNotionPage(artifact = null) {
 }
 
 async function readinessProbe() {
-  launchNotionIfNeeded();
+  launchRuntimeIfNeeded();
   const targets = await waitForDebugTargets();
   const target = pickPageTarget(targets);
   if (!target) {
@@ -1272,7 +1398,7 @@ async function attachNewestNotionAiTarget(artifact) {
       target &&
       target.type === "page" &&
       target.webSocketDebuggerUrl &&
-      String(target.url || "").startsWith("https://www.notion.so/ai")
+      isNotionRoute(target.url, "ai")
     );
     lastSeen = candidates.map((target) => ({ id: target.id, title: target.title, url: target.url }));
     for (const target of candidates) {
@@ -1445,7 +1571,7 @@ async function verifyPromptInserted(client, prompt, artifact, transport, started
   while (true) {
     updateActiveJob(artifact, "inserting_prompt", { transport, stageAgeMs: Date.now() - startedAt });
     state = await inputState(client);
-    const alreadySubmitted = String(state?.url || '').includes('notion.so/chat')
+    const alreadySubmitted = /https?:\/\/(?:[^/]+\.)?notion\.(?:so|com)\/chat/i.test(String(state?.url || ''))
       && bodyContainsPrompt(state?.body || '', promptNeedle(prompt))
       && (state?.stopActive || !state?.hasSubmit);
     if (alreadySubmitted) {
@@ -1685,7 +1811,7 @@ async function waitForChatStarted(client, artifact, prompt) {
       }))()`
     );
     const ownership = ownershipSnapshot(state?.body || "", prompt, artifact.requestMarker);
-    const isChat = String(state?.url || "").includes("notion.so/chat");
+    const isChat = isNotionRoute(state?.url, "chat");
     if (isChat) {
       const eventState = ownership.visibleOutput && !ownership.matchedPrompt
         ? "owned_chat_recovered_from_visible_output"
@@ -1718,7 +1844,7 @@ async function waitForChatStarted(client, artifact, prompt) {
     }
     if (Date.now() - started > CHAT_START_TIMEOUT_MS) {
       const finalOwnership = ownershipSnapshot(state?.body || "", prompt, artifact.requestMarker);
-      if (String(state?.url || "").includes("notion.so/chat") && finalOwnership.visibleOutput) {
+      if (isNotionRoute(state?.url, "chat") && finalOwnership.visibleOutput) {
         artifact.events.push({
           at: new Date().toISOString(),
           state: "owned_chat_recovered_from_visible_output",
@@ -1931,7 +2057,7 @@ async function reacquireOwnedChat(client, artifact, reason) {
       await delay(1500 * attempt);
       const state = await conversationState(client);
       const chatId = extractChatId(state.url);
-      const recovered = chatId === artifact.ownedChatId && String(state.url || "").includes("notion.so/chat");
+      const recovered = chatId === artifact.ownedChatId && isNotionRoute(state.url, "chat");
       artifact.events.push({
         at: new Date().toISOString(),
         state: recovered ? "owned_chat_reacquired" : "owned_chat_reacquire_observed_wrong_target",
@@ -1981,7 +2107,7 @@ async function waitForAnswer(client, prompt, artifact) {
       latest = recovered;
       latestChatId = extractChatId(latest.url);
     }
-    if (!String(latest.url || "").includes("notion.so/chat")) {
+    if (!isNotionRoute(latest.url, "chat")) {
       const recovered = await reacquireOwnedChat(client, artifact, `left_chat:${latest.url || "unknown url"}`);
       if (!recovered) {
         throw new Error(`owned_chat_reacquire_failed: target left chat page before answer extraction: ${latest.url || "unknown url"}`);
@@ -2324,13 +2450,20 @@ function toOpenAi(result) {
 }
 
 const server = http.createServer((req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization,Content-Type");
+  res.setHeader("X-Content-Type-Options", "nosniff");
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
+    return;
+  }
+
+  if (!isAuthorizedRequest(req.headers.authorization)) {
+    res.setHeader("WWW-Authenticate", "Bearer");
+    sendJson(res, 401, { error: "unauthorized" });
     return;
   }
 
@@ -2344,6 +2477,7 @@ const server = http.createServer((req, res) => {
       activeTargetIdList: Array.from(activeTargetIds),
       maxConcurrentRequests: MAX_CONCURRENT_REQUESTS,
       maxQueueDepth: MAX_QUEUE_DEPTH,
+      rateLimitPerMinute: RATE_LIMIT_PER_MINUTE,
       jobTimeoutMs: JOB_TIMEOUT_MS,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,
       quietMs: QUIET_MS,
@@ -2366,7 +2500,11 @@ const server = http.createServer((req, res) => {
       activeJobs: activeJobSnapshot(),
       queuedJobs: queuedJobSnapshot(),
       port: PORT,
+      host: HOST,
+      runtime: NOTION_RUNTIME,
+      cdpHost: CDP_HOST,
       debugPort: DEBUG_PORT,
+      authRequired: !!API_TOKEN,
       lastCompletedAt,
       lastArtifactPath,
       lastError,
@@ -2406,6 +2544,7 @@ const server = http.createServer((req, res) => {
         activeTargetIdList: Array.from(activeTargetIds),
         maxConcurrentRequests: MAX_CONCURRENT_REQUESTS,
         maxQueueDepth: MAX_QUEUE_DEPTH,
+        rateLimitPerMinute: RATE_LIMIT_PER_MINUTE,
         jobTimeoutMs: JOB_TIMEOUT_MS,
         requestTimeoutMs: REQUEST_TIMEOUT_MS,
         quietMs: QUIET_MS,
@@ -2427,7 +2566,11 @@ const server = http.createServer((req, res) => {
         activeJobs: activeJobSnapshot(),
         queuedJobs: queuedJobSnapshot(),
         port: PORT,
+        host: HOST,
+        runtime: NOTION_RUNTIME,
+        cdpHost: CDP_HOST,
         debugPort: DEBUG_PORT,
+        authRequired: !!API_TOKEN,
         targetCount: ready.targetCount,
         cdpProbe: ready.probe,
         composerProbe,
@@ -2478,6 +2621,16 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
+    const rate = checkRateLimit(req.socket?.remoteAddress || "unknown");
+    res.setHeader("X-RateLimit-Limit", String(RATE_LIMIT_PER_MINUTE));
+    if (rate.remaining !== null) {
+      res.setHeader("X-RateLimit-Remaining", String(rate.remaining));
+    }
+    if (!rate.allowed) {
+      res.setHeader("Retry-After", String(rate.retryAfterSeconds));
+      sendJson(res, 429, { error: "rate_limit_exceeded", retry_after_seconds: rate.retryAfterSeconds });
+      return;
+    }
     req.setTimeout(REQUEST_TIMEOUT_MS > 0 ? REQUEST_TIMEOUT_MS + 10000 : 0);
     readBody(req)
       .then(async (parsed) => {
@@ -2519,13 +2672,18 @@ const server = http.createServer((req, res) => {
 });
 
 if (require.main === module) {
+  validateNetworkConfig();
   server.listen(PORT, HOST, () => {
     server.timeout = REQUEST_TIMEOUT_MS > 0 ? REQUEST_TIMEOUT_MS + 10000 : 0;
     server.requestTimeout = REQUEST_TIMEOUT_MS > 0 ? REQUEST_TIMEOUT_MS + 10000 : 0;
     server.headersTimeout = 0;
-    log(`Clean Notion bridge listening at http://${HOST}:${PORT}`);
+    log(`Clean Notion bridge listening at http://${HOST}:${PORT}`, {
+      runtime: NOTION_RUNTIME,
+      cdp: `http://${CDP_HOST}:${DEBUG_PORT}`,
+      authRequired: !!API_TOKEN
+    });
     try {
-      launchNotionIfNeeded();
+      launchRuntimeIfNeeded();
     } catch (error) {
       log("Notion startup failed; watchdog will retry after the next provider readiness request", error.message);
     }
@@ -2565,8 +2723,15 @@ module.exports = {
   promptCorrelation,
   promptNeedle,
   requestMarker,
+  bearerTokenFromHeader,
+  isAuthorizedRequest,
+  isLoopbackHost,
+  isNotionRoute,
+  isNotionUrl,
+  validateNetworkConfig,
   ownershipConfidenceRank,
   classifyAnswerEvidence,
+  createFixedWindowRateLimiter,
   hasAnswerGenerationEvidence,
   shouldFailAnswerNoOutput,
   shouldAttemptSubmitAfterInsert,

@@ -1,26 +1,65 @@
 # Clean Notion Provider
 
-Local OpenAI-style chat-completions provider backed by a dedicated Notion desktop session.
+OpenAI-style chat-completions provider backed by a dedicated Notion AI session. It supports the proven Notion Desktop runtime and a Chrome runtime designed for a separate Windows provider laptop.
 
 ## Runtime
 
-- Endpoint: `POST http://127.0.0.1:3040/v1/chat/completions`
-- Health: `GET http://127.0.0.1:3040/health`
-- Readiness/CDP: `GET http://127.0.0.1:3040/ready`
+- Endpoint: `POST /v1/chat/completions`
+- Health: `GET /health`
+- Readiness/CDP: `GET /ready`
 - Manual idle cleanup: `POST http://127.0.0.1:3040/cleanup`
 - Notion CDP: `127.0.0.1:9333`
 - Concurrency: 1 active request, 50 queued by default
 - Hard request/job timeout: disabled by default
 - HTTP request body limit: disabled by default
 
-Start with:
+Local desktop start:
 
 ```powershell
 npm install
 npm start
 ```
 
-The bridge launches the installed Notion desktop app with `--remote-debugging-port=9333` when needed. The Notion profile must already be signed in to the `Lex` workspace.
+The default runtime remains Notion Desktop for backward compatibility. Set `NOTION_RUNTIME=chrome` to launch an isolated Chrome profile instead.
+
+## Dedicated Provider Laptop
+
+On the Windows 11 provider laptop:
+
+```powershell
+git clone https://github.com/pranay68/notion-gateway.git
+Set-Location .\notion-gateway
+.\scripts\setup-provider.ps1
+.\scripts\start-provider.ps1
+```
+
+The setup script installs missing Node.js/Chrome dependencies through `winget`, creates `.env` with a random bearer token, and creates ignored profile/artifact directories. The start script launches Chrome with a dedicated user-data directory and keeps CDP bound to `127.0.0.1:9333` even though the provider API listens on the LAN.
+
+On first launch, sign into the intended Notion workspace in that dedicated Chrome window. Do not use the profile for ordinary browsing.
+
+From an elevated PowerShell window on the provider laptop, allow only the main laptop's LAN address:
+
+```powershell
+.\scripts\configure-firewall.ps1 -MainLaptopIp '192.168.1.25'
+```
+
+Never forward port `3040` through the router and never expose port `9333`. The server refuses non-loopback API binding unless `CLEAN_BRIDGE_API_TOKEN` is configured, and it refuses non-loopback CDP configuration entirely.
+
+From the main laptop:
+
+```powershell
+.\scripts\test-remote.ps1 `
+  -ProviderUrl 'http://PROVIDER_LAPTOP_IP:3040' `
+  -Token 'TOKEN_FROM_PROVIDER_DOT_ENV'
+
+# After health succeeds, run one real generation proof:
+.\scripts\test-remote.ps1 `
+  -ProviderUrl 'http://PROVIDER_LAPTOP_IP:3040' `
+  -Token 'TOKEN_FROM_PROVIDER_DOT_ENV' `
+  -Generation
+```
+
+ReArch must send the same token as `Authorization: Bearer <token>` and read model content only from `choices[0].message.content`.
 
 ## Provider Contract
 
@@ -41,7 +80,7 @@ Read the result from `choices[0].message.content`.
 
 ## Tab Lifecycle
 
-Every request receives an isolated Notion chat target. Active and queued work blocks cleanup. Once the bridge is idle, cleanup uses Notion's real Electron tab-bar `Close Tab` controls and trims oldest tabs until seven remain. It does not close CDP renderer targets, because Notion restores those fake closures. An idle sweep runs every 30 seconds. Override the retained count with `CLEAN_BRIDGE_MAX_RETAINED_TABS`.
+Every request receives an isolated Notion chat target. Active and queued work blocks cleanup. In Desktop mode, idle cleanup uses Notion's Electron tab-bar controls and trims oldest tabs until seven remain. Chrome mode safely skips the Electron-only tab-bar cleanup path. Override the retained count with `CLEAN_BRIDGE_MAX_RETAINED_TABS`.
 
 An independent overlay watchdog scans every attached Notion page every 1.5 seconds, including while API workers are active. It uses trusted CDP mouse input to click only an exact visible `Got it` button. This prevents the trial/business-plan modal from blocking prompt submission. Override its interval with `CLEAN_BRIDGE_OVERLAY_WATCH_INTERVAL_MS`.
 
@@ -51,7 +90,7 @@ Answer generation remains unbounded, but a submitted owned chat that shows no ge
 
 Important: the old bridge observed `100000` rendered characters in the composer during a failed automated insertion path, but that is not proven to be Notion's true manual paste/model limit. Treat it as an automation/readback-path symptom. The bridge must not hard-block on that number; if transport inserts text and the composer is submit-ready, a rendered-length mismatch is recorded as evidence and the request proceeds.
 
-Artifacts default to `../work/notion-bridge-clean` relative to this repository. Set `CLEAN_BRIDGE_ARTIFACT_DIR` to use another location. Artifacts can contain prompts, UI snapshots, transitions, outputs, and failure evidence; do not commit them.
+Artifacts default to `../work/notion-bridge-clean`; the provider-laptop launcher redirects them to ignored `./artifacts`. Set `CLEAN_BRIDGE_ARTIFACT_DIR` to use another location. Artifacts can contain prompts, UI snapshots, transitions, outputs, and failure evidence; do not commit them.
 
 ## Prompt Transport
 
@@ -92,3 +131,19 @@ Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:3040/ready' -TimeoutSec 120
 ```
 
 Do not run a full ReArch mission merely to test the bridge. Start with one schema-shaped provider request.
+
+## Important Configuration
+
+| Variable | Purpose | Provider-laptop default |
+|---|---|---|
+| `NOTION_RUNTIME` | `desktop` or `chrome` | `chrome` |
+| `CLEAN_BRIDGE_HOST` | HTTP bind address | `0.0.0.0` |
+| `CLEAN_BRIDGE_API_TOKEN` | Required bearer token for LAN mode | Generated by setup |
+| `NOTION_DEBUG_HOST` | Internal CDP bind/connection address | `127.0.0.1` |
+| `NOTION_DEBUG_PORT` | Internal CDP port | `9333` |
+| `CHROME_USER_DATA_DIR` | Dedicated Chrome profile | `./data/chrome-profile` |
+| `CLEAN_BRIDGE_RATE_LIMIT_PER_MINUTE` | Per-client ingress safety limit | `60` |
+| `CLEAN_BRIDGE_MAX_CONCURRENT` | Active Notion UI workers | `1` |
+| `CLEAN_BRIDGE_MAX_QUEUE` | Pending API calls | `50` |
+
+Concurrency remains `1` because a single Notion UI profile is one mechanical authority lane. Multiple callers may queue safely, but increasing concurrency without separate browser/profile workers reintroduces target ownership conflicts.
