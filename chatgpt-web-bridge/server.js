@@ -24,6 +24,7 @@ const MECHANICAL_TIMEOUT_MS = Number(process.env.CHATGPT_MECHANICAL_TIMEOUT_MS |
 const VIEWPORT_WIDTH = Number(process.env.CHATGPT_VIEWPORT_WIDTH || 1366);
 const VIEWPORT_HEIGHT = Number(process.env.CHATGPT_VIEWPORT_HEIGHT || 900);
 const BRING_TO_FRONT = String(process.env.CHATGPT_BRING_TO_FRONT || "false").toLowerCase() === "true";
+const OWNERSHIP_GRACE_MS = Number(process.env.CHATGPT_OWNERSHIP_GRACE_MS || 120000);
 
 let browser = null;
 let browserProcess = null;
@@ -464,11 +465,37 @@ async function getAssistantTexts(page) {
   });
 }
 
+async function requestOwnershipState(page, requestId) {
+  return page.evaluate((id) => {
+    const bodyText = document.body ? document.body.innerText || "" : "";
+    const userTexts = [...document.querySelectorAll('[data-message-author-role="user"]')]
+      .map((node) => (node.innerText || node.textContent || "").trim())
+      .filter(Boolean);
+    const assistantTexts = [...document.querySelectorAll('[data-message-author-role="assistant"]')]
+      .map((node) => (node.innerText || node.textContent || "").trim())
+      .filter(Boolean);
+    return {
+      url: location.href,
+      title: document.title,
+      bodyHasRequestId: bodyText.includes(id),
+      userHasRequestId: userTexts.some((text) => text.includes(id)),
+      userCount: userTexts.length,
+      assistantCount: assistantTexts.length,
+      bodyLength: bodyText.length,
+      bodyPreview: bodyText.slice(0, 1500)
+    };
+  }, requestId);
+}
+
 function cleanAssistantText(text) {
   return String(text || "")
     .replace(/\n?ChatGPT can make mistakes\.[\s\S]*$/i, "")
     .replace(/\n?(Copy|Good response|Bad response|Share)$/gim, "")
     .trim();
+}
+
+function isConversationUrl(url) {
+  return /https:\/\/chatgpt\.com\/c\/[^/?#]+/i.test(String(url || ""));
 }
 
 async function waitForAnswer(page, beforeCount, artifact) {
@@ -479,30 +506,90 @@ async function waitForAnswer(page, beforeCount, artifact) {
   let lastText = "";
   let lastChanged = Date.now();
   let seenAny = false;
+  let lastOwnedAt = 0;
+  let ownedChatUrl = artifact.ownedChatUrl || null;
+  const waitStartedAt = Date.now();
 
   while (true) {
     const texts = await getAssistantTexts(page);
     const candidate = cleanAssistantText(texts.slice(beforeCount).join("\n\n") || texts[texts.length - 1] || "");
     const snap = await snapshot(page);
+    const ownership = await requestOwnershipState(page, artifact.requestId);
+    if (ownership.bodyHasRequestId || ownership.userHasRequestId) {
+      if (!lastOwnedAt) addEvent(artifact, "request_ownership_confirmed", ownership);
+      lastOwnedAt = Date.now();
+      if (isConversationUrl(ownership.url) && ownership.url !== ownedChatUrl) {
+        ownedChatUrl = ownership.url;
+        artifact.ownedChatUrl = ownedChatUrl;
+        addEvent(artifact, "owned_chat_url_frozen", { ownedChatUrl });
+      }
+    }
 
     artifact.candidateLength = candidate.length;
     artifact.stopActive = snap.stopActive;
     artifact.assistantCount = snap.assistantCount;
     artifact.url = snap.url;
     artifact.title = snap.title;
+    artifact.bodyHasRequestId = ownership.bodyHasRequestId;
+    artifact.userHasRequestId = ownership.userHasRequestId;
+    artifact.ownedChatUrl = ownedChatUrl;
 
     if (candidate && candidate !== lastText) {
       lastText = candidate;
       lastChanged = Date.now();
       seenAny = true;
-      addEvent(artifact, "answer_candidate_changed", { candidateLength: candidate.length, stopActive: snap.stopActive });
+      addEvent(artifact, "answer_candidate_changed", {
+        candidateLength: candidate.length,
+        stopActive: snap.stopActive,
+        bodyHasRequestId: ownership.bodyHasRequestId,
+        userHasRequestId: ownership.userHasRequestId,
+        url: ownership.url,
+        title: ownership.title
+      });
     } else {
       writeArtifact(artifact);
     }
 
+    const ownershipAgeMs = Date.now() - (lastOwnedAt || waitStartedAt);
+    if (!lastOwnedAt && ownershipAgeMs > OWNERSHIP_GRACE_MS) {
+      artifact.ownership = ownership;
+      writeArtifact(artifact);
+      throw new Error(`request_ownership_not_confirmed_after_submit: ${artifact.requestId} not visible in active ChatGPT conversation after ${OWNERSHIP_GRACE_MS}ms`);
+    }
+
+    if (lastOwnedAt && !ownership.bodyHasRequestId && !ownership.userHasRequestId && candidate) {
+      const lostMs = Date.now() - lastOwnedAt;
+      if (ownedChatUrl && ownership.url !== ownedChatUrl) {
+        addEvent(artifact, "owned_chat_reacquire_started", {
+          fromUrl: ownership.url,
+          ownedChatUrl,
+          lostMs,
+          candidateLength: candidate.length
+        });
+        await page.goto(ownedChatUrl, { waitUntil: "domcontentloaded", timeout: MECHANICAL_TIMEOUT_MS }).catch((error) => {
+          addEvent(artifact, "owned_chat_reacquire_failed", { error: error.message, ownedChatUrl });
+        });
+        await page.waitForTimeout(1000);
+        lastChanged = Date.now();
+        continue;
+      }
+      if (lostMs > 15000) {
+        artifact.ownership = ownership;
+        writeArtifact(artifact);
+        throw new Error(`request_ownership_lost_during_answer: active conversation no longer contains ${artifact.requestId}`);
+      }
+    }
+
     const quietMs = Date.now() - lastChanged;
     const composerReady = snap.hasComposer && !snap.stopActive;
-    if (seenAny && candidate && quietMs >= STABLE_QUIET_MS && composerReady) {
+    if (seenAny && candidate && !lastOwnedAt && quietMs >= STABLE_QUIET_MS && composerReady) {
+      artifact.ownership = ownership;
+      writeArtifact(artifact);
+      throw new Error(`request_ownership_not_confirmed_with_finished_candidate: active conversation produced text without ${artifact.requestId}`);
+    }
+
+    const currentlyOwned = Boolean(lastOwnedAt && (ownership.bodyHasRequestId || ownership.userHasRequestId || (ownedChatUrl && ownership.url === ownedChatUrl)));
+    if (seenAny && candidate && currentlyOwned && quietMs >= STABLE_QUIET_MS && composerReady) {
       addEvent(artifact, "answer_stable", { candidateLength: candidate.length, quietMs });
       return candidate;
     }
@@ -520,22 +607,34 @@ async function executeRequest(payload, artifact) {
   const page = await getPage();
   addEvent(artifact, "page_acquired", await snapshot(page));
 
-  await openFreshChat(page, artifact);
-  const beforeTexts = await getAssistantTexts(page);
-  artifact.beforeAssistantCount = beforeTexts.length;
-  writeArtifact(artifact);
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    artifact.attempt = attempt;
+    addEvent(artifact, "request_attempt_started", { attempt });
+    await openFreshChat(page, artifact);
+    const beforeTexts = await getAssistantTexts(page);
+    artifact.beforeAssistantCount = beforeTexts.length;
+    writeArtifact(artifact);
 
-  await insertPrompt(page, prompt, artifact);
-  await submitPrompt(page, artifact);
-  const answer = await waitForAnswer(page, beforeTexts.length, artifact);
+    try {
+      await insertPrompt(page, prompt, artifact);
+      await submitPrompt(page, artifact);
+      const answer = await waitForAnswer(page, beforeTexts.length, artifact);
 
-  artifact.phase = "completed";
-  artifact.outputLength = answer.length;
-  artifact.outputPreview = answer.slice(0, 2000);
-  addEvent(artifact, "request_completed", { outputLength: answer.length });
-  lastCompletedAt = nowIso();
-  transportDegraded = false;
-  return openAiResponse(answer, payload);
+      artifact.phase = "completed";
+      artifact.outputLength = answer.length;
+      artifact.outputPreview = answer.slice(0, 2000);
+      addEvent(artifact, "request_completed", { outputLength: answer.length, attempt });
+      lastCompletedAt = nowIso();
+      transportDegraded = false;
+      return openAiResponse(answer, payload);
+    } catch (error) {
+      const ownershipRetryable = /^request_ownership_(not_confirmed|lost)/.test(error.message);
+      addEvent(artifact, "request_attempt_failed", { attempt, retryable: ownershipRetryable, error: error.message });
+      if (!ownershipRetryable || attempt >= 2) throw error;
+    }
+  }
+
+  throw new Error("request_failed_without_result");
 }
 
 function enqueue(job) {
@@ -632,7 +731,8 @@ function healthPayload() {
     ,
     debugPort: HEADLESS ? null : DEBUG_PORT,
     launchMode: HEADLESS ? "playwright_headless" : "normal_chrome_cdp_attach",
-    bringToFront: BRING_TO_FRONT
+    bringToFront: BRING_TO_FRONT,
+    ownershipGraceMs: OWNERSHIP_GRACE_MS
   };
 }
 
@@ -722,5 +822,6 @@ module.exports = {
   healthPayload
   ,
   normalizeForAnchor,
-  promptAnchors
+  promptAnchors,
+  requestOwnershipState
 };
